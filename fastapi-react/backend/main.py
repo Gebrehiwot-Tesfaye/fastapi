@@ -5,8 +5,11 @@ from pydantic import BaseModel
 from typing import List, Optional
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
+import time
+import logging
 
 from database import get_db, Fruit as FruitModel, create_tables, test_connection
+from redis_client import redis_client
 
 class Fruit(BaseModel):
     name: str
@@ -43,14 +46,33 @@ app.add_middleware(
 
 @app.get("/fruits", response_model=Fruits)
 def get_fruits(db: Session = Depends(get_db)):
+    start_time = time.time()
+    
+    # Try to get from cache first
+    cache_key = "fruits:list"
+    cached_fruits = redis_client.get(cache_key)
+    
+    if cached_fruits:
+        end_time = time.time()
+        logging.info(f"🚀 Cache hit! Retrieved fruits in {(end_time - start_time)*1000:.2f}ms")
+        return Fruits(fruits=[Fruit(**fruit) for fruit in cached_fruits])
+    
+    # Cache miss - get from database
     fruits = db.query(FruitModel).all()
     fruit_list = []
     for fruit in fruits:
         fruit_data = {"name": fruit.name}
         if fruit.category is not None:
             fruit_data["category"] = fruit.category
-        fruit_list.append(Fruit(**fruit_data))
-    return Fruits(fruits=fruit_list)
+        fruit_list.append(fruit_data)
+    
+    # Cache the result for 1 hour (3600 seconds)
+    redis_client.set(cache_key, fruit_list, expire=3600)
+    
+    end_time = time.time()
+    logging.info(f"🐘 Database query! Retrieved fruits in {(end_time - start_time)*1000:.2f}ms")
+    
+    return Fruits(fruits=[Fruit(**fruit_data) for fruit_data in fruit_list])
 
 @app.post("/fruits")
 def add_fruit(fruit: Fruit, db: Session = Depends(get_db)):
@@ -64,7 +86,13 @@ def add_fruit(fruit: Fruit, db: Session = Depends(get_db)):
     db.add(db_fruit)
     db.commit()
     db.refresh(db_fruit)
+    
+    # Invalidate cache
+    redis_client.delete("fruits:list")
+    logging.info("🗑️ Cache invalidated after adding fruit")
+    
     return fruit
+
 @app.put("/fruits/{fruit_name}")
 def update_fruit(fruit_name: str, fruit: Fruit, db: Session = Depends(get_db)):
     db_fruit = db.query(FruitModel).filter(FruitModel.name == fruit_name).first()
@@ -74,7 +102,13 @@ def update_fruit(fruit_name: str, fruit: Fruit, db: Session = Depends(get_db)):
     db_fruit.category = fruit.category
     db.commit()
     db.refresh(db_fruit)
+    
+    # Invalidate cache
+    redis_client.delete("fruits:list")
+    logging.info("🗑️ Cache invalidated after updating fruit")
+    
     return fruit
+
 @app.delete("/fruits/{fruit_name}")
 def delete_fruit(fruit_name: str, db: Session = Depends(get_db)):
     fruit = db.query(FruitModel).filter(FruitModel.name == fruit_name).first()
@@ -82,7 +116,12 @@ def delete_fruit(fruit_name: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Fruit not found")
     db.delete(fruit)
     db.commit()
+    
+    # Invalidate cache
+    redis_client.delete("fruits:list")
+    logging.info("🗑️ Cache invalidated after deleting fruit")
+    
     return {"message": "Fruit deleted"}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
